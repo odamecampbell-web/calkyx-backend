@@ -1,0 +1,12 @@
+{
+  "name": "calkyx-backend",
+  "version": "1.0.0",
+  "description": "CALKYX core ledger and fee engine API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
