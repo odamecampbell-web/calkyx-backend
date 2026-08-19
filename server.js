@@ -11,6 +11,7 @@ const url = require("url");
 const engine = require("./engine");
 const auth = require("./auth");
 const { readAllEvents } = require("./ledger");
+const { runSeed, alreadySeeded } = require("./seed");
 
 const PORT = process.env.PORT || 4000;
 
@@ -210,6 +211,15 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, readAllEvents());
     }
 
+    // POST /ops/seed — manually trigger demo data population (ops only).
+    // Safe to call anytime — refuses to run if the platform already has strategies.
+    if (p === "/ops/seed" && req.method === "POST") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "ops") return send(res, 403, { error: "ops only" });
+      const result = runSeed();
+      return send(res, 200, result);
+    }
+
     // GET /health
     if (p === "/health") {
       return send(res, 200, { status: "ok", time: new Date().toISOString() });
@@ -228,6 +238,17 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`CALKYX API server running on http://localhost:${PORT}`);
   console.log(`Try:  curl http://localhost:${PORT}/strategies`);
+
+  // Auto-seed on startup if the RUN_SEED environment variable is set to "true".
+  // Safe to leave on permanently — runSeed() refuses to touch a non-empty platform.
+  if (process.env.RUN_SEED === "true") {
+    console.log("RUN_SEED is set — checking whether to seed demo data...");
+    try {
+      runSeed();
+    } catch (err) {
+      console.error("Seed attempt failed (server continues running normally):", err.message);
+    }
+  }
 });
 
 module.exports = server;
