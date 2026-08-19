@@ -18,6 +18,7 @@ const TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
 // User storage
 // ---------------------------------------------------------------------
 function loadUsers() {
+  fs.mkdirSync(path.dirname(USERS_PATH), { recursive: true });
   if (!fs.existsSync(USERS_PATH)) {
     const seeded = {};
     // Seed one ops/admin account so the ops console has a way in.
@@ -35,6 +36,20 @@ function saveUsers(users) {
 
 function hashPassword(password, salt) {
   return crypto.scryptSync(password, salt, 64).toString("hex");
+}
+
+function changePassword(userId, oldPassword, newPassword) {
+  if (!newPassword || newPassword.length < 8) throw new Error("new password must be at least 8 characters");
+  const users = loadUsers();
+  const user = users[userId];
+  if (!user) throw new Error("user not found");
+  const oldHash = hashPassword(oldPassword, user.salt);
+  if (oldHash !== user.hash) throw new Error("current password is incorrect");
+  const newSalt = crypto.randomBytes(16).toString("hex");
+  user.salt = newSalt;
+  user.hash = hashPassword(newPassword, newSalt);
+  saveUsers(users);
+  return { success: true };
 }
 
 function createUserRecord(id, email, password, role, name) {
@@ -131,4 +146,4 @@ function requireAuth(req) {
   return user;
 }
 
-module.exports = { register, login, requireAuth, getUserById, verifyToken };
+module.exports = { register, login, requireAuth, getUserById, verifyToken, changePassword };

@@ -12,6 +12,7 @@ const path = require("path");
 const LOG_PATH = path.join(__dirname, "data", "cashflow-log.jsonl");
 
 function ensureLogExists() {
+  fs.mkdirSync(path.dirname(LOG_PATH), { recursive: true }); // defensive: works even on a brand-new empty volume mount
   if (!fs.existsSync(LOG_PATH)) fs.writeFileSync(LOG_PATH, "");
 }
 

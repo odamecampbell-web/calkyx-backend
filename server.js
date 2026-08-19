@@ -14,6 +14,16 @@ const { readAllEvents } = require("./ledger");
 
 const PORT = process.env.PORT || 4000;
 
+// Safety net: log and keep serving instead of dying outright. Every request
+// already re-reads fresh state from the ledger file, so a crash mid-request
+// can't leave shared in-memory state corrupted — it's safe to stay up.
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION (server staying up):", err);
+});
+process.on("unhandledRejection", (err) => {
+  console.error("UNHANDLED REJECTION (server staying up):", err);
+});
+
 function send(res, status, data) {
   res.writeHead(status, {
     "Content-Type": "application/json",
@@ -60,6 +70,41 @@ const server = http.createServer(async (req, res) => {
     if (p === "/auth/me" && req.method === "GET") {
       const user = auth.requireAuth(req);
       return send(res, 200, user);
+    }
+
+    // POST /auth/change-password  { oldPassword, newPassword }
+    if (p === "/auth/change-password" && req.method === "POST") {
+      const user = auth.requireAuth(req);
+      const { oldPassword, newPassword } = await readBody(req);
+      const result = auth.changePassword(user.id, oldPassword, newPassword);
+      return send(res, 200, result);
+    }
+
+    // GET /wallet — current investor's cash balance
+    if (p === "/wallet" && req.method === "GET") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "investor") return send(res, 403, { error: "investors only" });
+      return send(res, 200, { balance: engine.getWalletBalance(user.id) });
+    }
+
+    // POST /wallet/fund  { amount } — simulates funds arriving (real version would be a custodian webhook)
+    if (p === "/wallet/fund" && req.method === "POST") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "investor") return send(res, 403, { error: "investors only" });
+      const { amount } = await readBody(req);
+      if (typeof amount !== "number" || !Number.isFinite(amount)) return send(res, 400, { error: "amount must be a number" });
+      const record = engine.fundWallet(user.id, amount);
+      return send(res, 200, record);
+    }
+
+    // POST /wallet/withdraw  { amount } — cash out of the wallet (simulates a payout to bank/mobile money)
+    if (p === "/wallet/withdraw" && req.method === "POST") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "investor") return send(res, 403, { error: "investors only" });
+      const { amount } = await readBody(req);
+      if (typeof amount !== "number" || !Number.isFinite(amount)) return send(res, 400, { error: "amount must be a number" });
+      const record = engine.withdrawWallet(user.id, amount);
+      return send(res, 200, record);
     }
 
     // GET /strategies — marketplace listing (live only, public — no login needed to browse)
@@ -116,7 +161,8 @@ const server = http.createServer(async (req, res) => {
       const user = auth.requireAuth(req);
       if (user.role !== "investor") return send(res, 403, { error: "only investors can deposit" });
       const { strategyId, amount } = await readBody(req);
-      if (!strategyId || !amount) return send(res, 400, { error: "strategyId, amount required" });
+      if (typeof strategyId !== "string" || !strategyId) return send(res, 400, { error: "strategyId required" });
+      if (typeof amount !== "number" || !Number.isFinite(amount)) return send(res, 400, { error: "amount must be a number" });
       const record = engine.deposit(user.id, strategyId, amount);
       return send(res, 200, record);
     }
@@ -126,7 +172,8 @@ const server = http.createServer(async (req, res) => {
       const user = auth.requireAuth(req);
       if (user.role !== "investor") return send(res, 403, { error: "only investors can withdraw" });
       const { strategyId, units } = await readBody(req);
-      if (!strategyId || !units) return send(res, 400, { error: "strategyId, units required" });
+      if (typeof strategyId !== "string" || !strategyId) return send(res, 400, { error: "strategyId required" });
+      if (typeof units !== "number" || !Number.isFinite(units)) return send(res, 400, { error: "units must be a number" });
       const record = engine.withdraw(user.id, strategyId, units);
       return send(res, 200, record);
     }
@@ -171,7 +218,9 @@ const server = http.createServer(async (req, res) => {
     return send(res, 404, { error: "not found", path: p });
   } catch (err) {
     const authErrors = ["no token provided", "malformed token", "invalid token signature", "token expired", "user no longer exists"];
-    const status = authErrors.includes(err.message) ? 401 : (err.message.includes("already exists") || err.message.includes("required") || err.message.includes("invalid email") ? 400 : 500);
+    const isAuthError = authErrors.includes(err.message);
+    const isBadRequest = /already exists|required|invalid email|must be a positive number|insufficient|at least 8 characters|incorrect|not found|you only hold|not found or not live|decision must be/i.test(err.message);
+    const status = isAuthError ? 401 : (isBadRequest ? 400 : 500);
     return send(res, status, { error: err.message });
   }
 });

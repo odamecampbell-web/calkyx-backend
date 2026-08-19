@@ -20,16 +20,13 @@ function tierFor(aum) {
 const fs = require("fs");
 const path = require("path");
 const REGISTRY_PATH = path.join(__dirname, "data", "strategy-registry.json");
-
-const DEFAULT_REGISTRY = {
-  "alpha-macro": { id: "alpha-macro", name: "Alpha Macro", traderId: "trader_8842", risk: "Moderate", status: "live", mandate: "Global macro positioning across G10 FX and rates, max 5x leverage.", style: "Macro / Trend", capacity: 5_000_000 },
-  "steady-carry": { id: "steady-carry", name: "Steady Carry", traderId: "trader_9013", risk: "Conservative", status: "live", mandate: "Low-volatility carry strategy, max 2x leverage.", style: "Carry / Income", capacity: 3_000_000 },
-  "momentum-edge": { id: "momentum-edge", name: "Momentum Edge", traderId: "trader_7754", risk: "Aggressive", status: "live", mandate: "Systematic trend-following, max 8x leverage.", style: "Trend Following", capacity: 2_000_000 },
-};
+// Demo data is populated via seed.js, not hardcoded here — keeps the marketplace
+// clean and avoids duplicate/stale entries across deployments.
 
 function loadRegistry() {
+  fs.mkdirSync(path.dirname(REGISTRY_PATH), { recursive: true });
   if (!fs.existsSync(REGISTRY_PATH)) {
-    fs.writeFileSync(REGISTRY_PATH, JSON.stringify(DEFAULT_REGISTRY, null, 2));
+    fs.writeFileSync(REGISTRY_PATH, JSON.stringify({}, null, 2)); // starts empty — use seed.js to populate demo data
   }
   return JSON.parse(fs.readFileSync(REGISTRY_PATH, "utf8"));
 }
@@ -78,11 +75,20 @@ function rebuildState() {
   }
 
   const positions = {}; // `${investorId}::${strategyId}` -> { units, hwm, deposited }
+  const wallets = {}; // investorId -> cash balance (real, server-tracked — not a client-side number)
 
   function unitPrice(s) { return s.units === 0 ? 100 : s.nav / s.units; }
   function posKey(investorId, strategyId) { return `${investorId}::${strategyId}`; }
 
   for (const ev of events) {
+    if (ev.type === "wallet_deposit") {
+      wallets[ev.investorId] = (wallets[ev.investorId] || 0) + ev.amount;
+    }
+
+    if (ev.type === "wallet_withdrawal") {
+      wallets[ev.investorId] = (wallets[ev.investorId] || 0) - ev.amount;
+    }
+
     if (ev.type === "market_return") {
       const s = strategies[ev.strategyId];
       if (s) s.nav = s.nav * (1 + ev.pct);
@@ -91,6 +97,7 @@ function rebuildState() {
     if (ev.type === "deposit") {
       const s = strategies[ev.strategyId];
       if (!s) continue;
+      wallets[ev.investorId] = (wallets[ev.investorId] || 0) - ev.amount; // moving cash into a strategy
       const price = unitPrice(s);
       const units = ev.amount / price;
       s.nav += ev.amount;
@@ -115,6 +122,7 @@ function rebuildState() {
         pos.units -= ev.units;
         s.units -= ev.units;
         s.nav -= grossAmount;
+        wallets[ev.investorId] = (wallets[ev.investorId] || 0) + grossAmount; // proceeds return to the wallet
       }
     }
 
@@ -133,20 +141,59 @@ function rebuildState() {
     }
   }
 
-  return { strategies, positions, unitPrice, posKey };
+  return { strategies, positions, wallets, unitPrice, posKey };
 }
 
 // ---- Public operations. Every one of these APPENDS to the log first. ----
 
+// Simulates funding — a real deployment would call this only after a
+// custodian/broker confirms funds actually arrived (Stage 4, §4.4).
+function fundWallet(investorId, amount) {
+  validatePositiveNumber(amount, "amount");
+  return appendEvent({ type: "wallet_deposit", investorId, amount });
+}
+
+function validatePositiveNumber(value, label) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    throw new Error(`${label} must be a positive number`);
+  }
+}
+
+function withdrawWallet(investorId, amount) {
+  validatePositiveNumber(amount, "amount");
+  const { wallets } = rebuildState();
+  const balance = wallets[investorId] || 0;
+  if (amount > balance) throw new Error(`insufficient wallet balance ($${balance.toFixed(2)} available)`);
+  return appendEvent({ type: "wallet_withdrawal", investorId, amount });
+}
+
+function getWalletBalance(investorId) {
+  const { wallets } = rebuildState();
+  return wallets[investorId] || 0;
+}
+
 function deposit(investorId, strategyId, amount) {
+  validatePositiveNumber(amount, "amount");
+  const { wallets, strategies } = rebuildState();
+  if (!strategies[strategyId]) throw new Error("strategy not found or not live");
+  const balance = wallets[investorId] || 0;
+  if (amount > balance) throw new Error(`insufficient wallet balance ($${balance.toFixed(2)} available) — fund your wallet first`);
   return appendEvent({ type: "deposit", investorId, strategyId, amount });
 }
 
 function withdraw(investorId, strategyId, units) {
+  validatePositiveNumber(units, "units");
+  const { positions, posKey } = rebuildState();
+  const pos = positions[posKey(investorId, strategyId)];
+  const held = pos ? pos.units : 0;
+  if (units > held) throw new Error(`you only hold ${held.toFixed(4)} units in this strategy`);
   return appendEvent({ type: "withdrawal", investorId, strategyId, units });
 }
 
 function marketReturn(strategyId, pct) {
+  if (typeof pct !== "number" || !Number.isFinite(pct)) throw new Error("pct must be a valid number");
+  const { strategies } = rebuildState();
+  if (!strategies[strategyId]) throw new Error("strategy not found or not live");
   return appendEvent({ type: "market_return", strategyId, pct });
 }
 
@@ -215,4 +262,5 @@ module.exports = {
   rebuildState, deposit, withdraw, marketReturn, crystallizeFees,
   getPortfolio, getStrategies, getTraderCompensation, tierFor, TIERS,
   submitStrategy, decideStrategy, getRegistry,
+  fundWallet, withdrawWallet, getWalletBalance,
 };
