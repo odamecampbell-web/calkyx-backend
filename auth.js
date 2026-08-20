@@ -25,6 +25,7 @@ function loadUsers() {
     // CHANGE THIS PASSWORD after first login — there's no self-registration for ops on purpose.
     const adminId = "ops_admin";
     seeded[adminId] = createUserRecord(adminId, "admin@calkyx.com", "CalkyxAdmin2026!", "ops", "Ops Admin");
+    seeded[adminId].usingSeededPassword = true; // tracked explicitly — not guessed from email
     fs.writeFileSync(USERS_PATH, JSON.stringify(seeded, null, 2));
   }
   return JSON.parse(fs.readFileSync(USERS_PATH, "utf8"));
@@ -48,6 +49,7 @@ function changePassword(userId, oldPassword, newPassword) {
   const newSalt = crypto.randomBytes(16).toString("hex");
   user.salt = newSalt;
   user.hash = hashPassword(newPassword, newSalt);
+  user.usingSeededPassword = false; // real fix: tracked explicitly, not inferred from email
   saveUsers(users);
   return { success: true };
 }
@@ -96,7 +98,7 @@ function login({ email, password }) {
 }
 
 function publicUser(user) {
-  return { id: user.id, email: user.email, role: user.role, name: user.name };
+  return { id: user.id, email: user.email, role: user.role, name: user.name, usingSeededPassword: !!user.usingSeededPassword };
 }
 
 // ---------------------------------------------------------------------
