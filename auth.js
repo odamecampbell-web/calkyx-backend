@@ -67,6 +67,17 @@ function findUserByEmail(users, email) {
   return Object.values(users).find(u => u.email === email.toLowerCase());
 }
 
+// For seeding only: create the user if they don't exist yet, or return the
+// existing one untouched if they do. Never throws on "already exists" —
+// this is what makes seeding safely re-runnable after a partial failure.
+function registerOrGet({ email, password, name, role }) {
+  const users = loadUsers();
+  const existing = findUserByEmail(users, email);
+  if (existing) return { user: publicUser(existing), created: false };
+  const created = register({ email, password, name, role });
+  return { user: created, created: true };
+}
+
 // ---------------------------------------------------------------------
 // Public operations
 // ---------------------------------------------------------------------
@@ -148,4 +159,4 @@ function requireAuth(req) {
   return user;
 }
 
-module.exports = { register, login, requireAuth, getUserById, verifyToken, changePassword };
+module.exports = { register, login, requireAuth, getUserById, verifyToken, changePassword, registerOrGet };

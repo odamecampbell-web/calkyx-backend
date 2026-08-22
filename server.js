@@ -11,7 +11,7 @@ const url = require("url");
 const engine = require("./engine");
 const auth = require("./auth");
 const { readAllEvents } = require("./ledger");
-const { runSeed, alreadySeeded } = require("./seed");
+const { runSeed } = require("./seed");
 
 const PORT = process.env.PORT || 4000;
 
@@ -240,7 +240,8 @@ server.listen(PORT, () => {
   console.log(`Try:  curl http://localhost:${PORT}/strategies`);
 
   // Auto-seed on startup if the RUN_SEED environment variable is set to "true".
-  // Safe to leave on permanently — runSeed() refuses to touch a non-empty platform.
+  // Safe to leave on permanently — runSeed() is fully idempotent, it only
+  // creates what's missing and never duplicates or double-funds anything.
   if (process.env.RUN_SEED === "true") {
     console.log("RUN_SEED is set — checking whether to seed demo data...");
     try {
