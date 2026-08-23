@@ -301,6 +301,18 @@ const server = http.createServer(async (req, res) => {
       if (user.role !== "investor") return send(res, 403, { error: "investors only" });
       return send(res, 200, engine.getRiskNoticesForInvestor(user.id));
     }
+    // GET /risk-events/for-strategy/:strategyId — trader sees ALL risk events (any severity) on their own strategy
+    if (/^\/risk-events\/for-strategy\/[^/]+$/.test(p) && req.method === "GET") {
+      const user = auth.requireAuth(req);
+      const strategyId = p.split("/")[3];
+      const registry = engine.getRegistry();
+      const strategy = registry[strategyId];
+      if (!strategy) return send(res, 404, { error: "strategy not found" });
+      if (user.role === "trader" && strategy.traderId !== user.id) return send(res, 403, { error: "not your strategy" });
+      if (user.role !== "trader" && user.role !== "ops") return send(res, 403, { error: "not permitted" });
+      const events = readAllEvents().filter(e => e.type === "risk_event" && e.strategyId === strategyId);
+      return send(res, 200, events);
+    }
     // POST /risk-events/:id/acknowledge  { action: "dismissed"|"reduced_allocation" }
     if (/^\/risk-events\/[^/]+\/acknowledge$/.test(p) && req.method === "POST") {
       const user = auth.requireAuth(req);
@@ -325,6 +337,18 @@ const server = http.createServer(async (req, res) => {
       const user = auth.requireAuth(req);
       if (user.role !== "ops") return send(res, 403, { error: "ops only" });
       return send(res, 200, engine.getPendingMandateChanges());
+    }
+    // GET /mandate-changes/mine-as-trader — trader sees their own proposals, any status
+    if (p === "/mandate-changes/mine-as-trader" && req.method === "GET") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "trader") return send(res, 403, { error: "traders only" });
+      const events = readAllEvents();
+      const proposed = events.filter(e => e.type === "mandate_change_proposed" && e.traderId === user.id);
+      const decisions = events.filter(e => e.type === "mandate_change_decided");
+      return send(res, 200, proposed.map(p => {
+        const decision = decisions.find(d => d.changeId === p.changeId);
+        return { ...p, status: decision ? decision.decision : "pending" };
+      }));
     }
     // POST /mandate-changes/:id/decision  { decision } — ops approve/reject
     if (/^\/mandate-changes\/[^/]+\/decision$/.test(p) && req.method === "POST") {
