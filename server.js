@@ -286,6 +286,96 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, record);
     }
 
+    // ===== RISK EVENTS =====
+    // POST /risk-events  { strategyId, severity, description } — ops only
+    if (p === "/risk-events" && req.method === "POST") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "ops") return send(res, 403, { error: "ops only" });
+      const { strategyId, severity, description } = await readBody(req);
+      const record = engine.submitRiskEvent(strategyId, severity, description);
+      return send(res, 200, record);
+    }
+    // GET /risk-events/mine — investor's unacknowledged Material+ notices
+    if (p === "/risk-events/mine" && req.method === "GET") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "investor") return send(res, 403, { error: "investors only" });
+      return send(res, 200, engine.getRiskNoticesForInvestor(user.id));
+    }
+    // POST /risk-events/:id/acknowledge  { action: "dismissed"|"reduced_allocation" }
+    if (/^\/risk-events\/[^/]+\/acknowledge$/.test(p) && req.method === "POST") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "investor") return send(res, 403, { error: "investors only" });
+      const riskEventId = p.split("/")[2];
+      const { action } = await readBody(req);
+      const record = engine.acknowledgeRiskEvent(user.id, riskEventId, action);
+      return send(res, 200, record);
+    }
+
+    // ===== MANDATE CHANGES =====
+    // POST /mandate-changes  { strategyId, changes } — trader proposes
+    if (p === "/mandate-changes" && req.method === "POST") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "trader") return send(res, 403, { error: "traders only" });
+      const { strategyId, changes } = await readBody(req);
+      const record = engine.proposeMandateChange(strategyId, user.id, changes);
+      return send(res, 200, record);
+    }
+    // GET /mandate-changes/pending — ops review queue
+    if (p === "/mandate-changes/pending" && req.method === "GET") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "ops") return send(res, 403, { error: "ops only" });
+      return send(res, 200, engine.getPendingMandateChanges());
+    }
+    // POST /mandate-changes/:id/decision  { decision } — ops approve/reject
+    if (/^\/mandate-changes\/[^/]+\/decision$/.test(p) && req.method === "POST") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "ops") return send(res, 403, { error: "ops only" });
+      const changeId = p.split("/")[2];
+      const { decision } = await readBody(req);
+      const record = engine.decideMandateChange(changeId, decision);
+      return send(res, 200, record);
+    }
+    // GET /mandate-changes/mine — investor's pending exit-window notices
+    if (p === "/mandate-changes/mine" && req.method === "GET") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "investor") return send(res, 403, { error: "investors only" });
+      return send(res, 200, engine.getMandateNoticesForInvestor(user.id));
+    }
+    // POST /mandate-changes/:id/respond  { action: "exit"|"stay" }
+    if (/^\/mandate-changes\/[^/]+\/respond$/.test(p) && req.method === "POST") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "investor") return send(res, 403, { error: "investors only" });
+      const changeId = p.split("/")[2];
+      const { action } = await readBody(req);
+      const record = engine.respondToMandateChange(user.id, changeId, action);
+      return send(res, 200, record);
+    }
+
+    // ===== STRATEGY CLOSURE =====
+    // POST /strategies/:id/initiate-closure  { targetDate } — ops only
+    if (/^\/strategies\/[^/]+\/initiate-closure$/.test(p) && req.method === "POST") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "ops") return send(res, 403, { error: "ops only" });
+      const strategyId = p.split("/")[2];
+      const { targetDate } = await readBody(req);
+      const record = engine.initiateStrategyClosure(strategyId, targetDate);
+      return send(res, 200, record);
+    }
+    // POST /strategies/:id/finalize-closure — ops only, sweeps every remaining position
+    if (/^\/strategies\/[^/]+\/finalize-closure$/.test(p) && req.method === "POST") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "ops") return send(res, 403, { error: "ops only" });
+      const strategyId = p.split("/")[2];
+      const record = engine.finalizeStrategyClosure(strategyId);
+      return send(res, 200, record);
+    }
+    // GET /closure-notices/mine — investor's active strategy-closure notices
+    if (p === "/closure-notices/mine" && req.method === "GET") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "investor") return send(res, 403, { error: "investors only" });
+      return send(res, 200, engine.getClosureNoticeForInvestor(user.id));
+    }
+
     // GET /ops/audit-log — ops role required
     if (p === "/ops/audit-log" && req.method === "GET") {
       const user = auth.requireAuth(req);
@@ -311,7 +401,7 @@ const server = http.createServer(async (req, res) => {
   } catch (err) {
     const authErrors = ["no token provided", "malformed token", "invalid token signature", "token expired", "user no longer exists"];
     const isAuthError = authErrors.includes(err.message);
-    const isBadRequest = /already exists|required|invalid email|must be a positive number|insufficient|at least 8 characters|incorrect|not found|you only hold|not found or not live|decision must be|missing or invalid answer|version mismatch|invalid status|subject and message/i.test(err.message);
+    const isBadRequest = /already exists|required|invalid email|must be a positive number|insufficient|at least 8 characters|incorrect|not found|you only hold|not found or not live|decision must be|missing or invalid answer|version mismatch|invalid status|subject and message|invalid severity|not your strategy|not accepting new allocations|paused new allocations|only live strategies|not in a closing state|action must be|changes required|mandate change not found|strategy is not/i.test(err.message);
     const status = isAuthError ? 401 : (isBadRequest ? 400 : 500);
     return send(res, status, { error: err.message });
   }

@@ -70,7 +70,17 @@ function rebuildState() {
 
   const strategies = {}; // id -> { nav, units }
   for (const id of Object.keys(registry)) {
-    if (registry[id].status !== "live") continue; // only live strategies are tradable
+    // "live" strategies are open to new allocations; "closing" ones are winding
+    // down but must STILL have their positions tracked (so they can be swept
+    // back to investors) — "closed"/"pending"/"rejected" are excluded entirely.
+    // Only exclude strategies that NEVER went live (pending/rejected — no
+    // financial events could reference them). "live", "closing", AND "closed"
+    // must all stay included here, or replay becomes unstable: a strategy
+    // that's since closed would silently drop out of every future replay,
+    // breaking historical events that reference it. Public-facing filtering
+    // (only show "live" ones for new allocations) happens in getStrategies(),
+    // not here — this map exists purely for correct financial replay.
+    if (registry[id].status === "pending" || registry[id].status === "rejected") continue;
     strategies[id] = { ...registry[id], nav: 0, units: 0 };
   }
 
@@ -188,7 +198,10 @@ function getWalletBalance(investorId) {
 function deposit(investorId, strategyId, amount) {
   validatePositiveNumber(amount, "amount");
   const { wallets, strategies } = rebuildState();
-  if (!strategies[strategyId]) throw new Error("strategy not found or not live");
+  const s = strategies[strategyId];
+  if (!s) throw new Error("strategy not found or not live");
+  if (s.status !== "live") throw new Error(`this strategy is not accepting new allocations (status: ${s.status})`);
+  if (s.allocationsPaused) throw new Error("this strategy has paused new allocations pending a risk review");
   const balance = wallets[investorId] || 0;
   if (amount > balance) throw new Error(`insufficient wallet balance ($${balance.toFixed(2)} available) — fund your wallet first`);
   return appendEvent({ type: "deposit", investorId, strategyId, amount });
@@ -299,7 +312,10 @@ function getPortfolio(investorId) {
 
 function getStrategies() {
   const { strategies, unitPrice } = rebuildState();
-  return Object.values(strategies).map(s => ({ ...s, unitPrice: unitPrice(s), tier: tierFor(s.nav) }));
+  // Public marketplace only shows genuinely open strategies — "closing" ones
+  // are still tracked internally (positions must remain computable) but
+  // shouldn't invite new allocations from the storefront.
+  return Object.values(strategies).filter(s => s.status === "live").map(s => ({ ...s, unitPrice: unitPrice(s), tier: tierFor(s.nav) }));
 }
 
 function getTraderCompensation(traderId) {
@@ -469,7 +485,191 @@ function closeAccount(investorId) {
   return { closedPositions: results };
 }
 
+// =====================================================================
+// RISK EVENTS — Stage 2, §E1. Severity ladder. Ops flags a real event
+// against a live strategy; investors HOLDING that strategy see it with
+// real actions (Reduce Allocation / Keep Watching), not a passive banner.
+// =====================================================================
+function submitRiskEvent(strategyId, severity, description) {
+  if (!["Informational", "Warning", "Material", "Severe"].includes(severity)) throw new Error("invalid severity");
+  if (!description) throw new Error("description required");
+  const { strategies } = rebuildState();
+  if (!strategies[strategyId]) throw new Error("strategy not found or not live");
+  const id = "risk-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 6);
+  if (severity === "Material" || severity === "Severe") {
+    pauseNewAllocations(strategyId, true); // pause new allocations on Material+ (Stage 2, §E1)
+  }
+  return appendEvent({ type: "risk_event", riskEventId: id, strategyId, severity, description });
+}
+
+// Helper: Material/Severe risk events pause NEW allocations into that
+// strategy — existing investors are unaffected (Stage 2, §E1 principle).
+function pauseNewAllocations(strategyId, paused) {
+  const registry = loadRegistry();
+  if (registry[strategyId]) {
+    registry[strategyId].allocationsPaused = paused;
+    saveRegistry(registry);
+  }
+}
+
+function acknowledgeRiskEvent(investorId, riskEventId, action) {
+  if (!["dismissed", "reduced_allocation"].includes(action)) throw new Error("invalid action");
+  return appendEvent({ type: "risk_event_acknowledged", investorId, riskEventId, action });
+}
+
+// Returns unacknowledged Material/Severe risk events for strategies this
+// investor currently holds a position in.
+function getRiskNoticesForInvestor(investorId) {
+  const events = readAllEvents();
+  const { positions, posKey, strategies } = rebuildState();
+  const heldStrategyIds = Object.keys(positions)
+    .filter(k => k.startsWith(investorId + "::") && positions[k].units > 0)
+    .map(k => k.split("::")[1]);
+
+  const riskEvents = events.filter(e => e.type === "risk_event" && (e.severity === "Material" || e.severity === "Severe") && heldStrategyIds.includes(e.strategyId));
+  const acks = events.filter(e => e.type === "risk_event_acknowledged" && e.investorId === investorId).map(e => e.riskEventId);
+
+  return riskEvents
+    .filter(e => !acks.includes(e.riskEventId))
+    .map(e => {
+      const pos = positions[posKey(investorId, e.strategyId)];
+      const s = strategies[e.strategyId];
+      return { ...e, strategyName: s ? s.name : e.strategyId, yourPositionValue: pos ? pos.units * (s.units === 0 ? 100 : s.nav / s.units) : 0 };
+    });
+}
+
+// =====================================================================
+// MANDATE CHANGES — Stage 2, §G1. A material mandate change on a LIVE
+// strategy requires re-approval (mini version of the original approval
+// gate) and gives affected investors a real exit window before it takes
+// effect — never a silent edit.
+// =====================================================================
+function proposeMandateChange(strategyId, traderId, changes) {
+  const registry = loadRegistry();
+  const strategy = registry[strategyId];
+  if (!strategy) throw new Error("strategy not found");
+  if (strategy.traderId !== traderId) throw new Error("not your strategy");
+  if (strategy.status !== "live") throw new Error("only live strategies can propose a mandate change");
+  if (!changes || typeof changes !== "object") throw new Error("changes required");
+
+  const id = "change-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 6);
+  return appendEvent({
+    type: "mandate_change_proposed", changeId: id, strategyId, traderId,
+    before: { mandate: strategy.mandate, maxLeverage: strategy.maxLeverage, maxDrawdown: strategy.maxDrawdown, style: strategy.style },
+    after: changes, status: "pending",
+  });
+}
+
+function decideMandateChange(changeId, decision) {
+  if (!["approved", "rejected"].includes(decision)) throw new Error("decision must be approved or rejected");
+  const events = readAllEvents();
+  const proposal = events.find(e => e.type === "mandate_change_proposed" && e.changeId === changeId);
+  if (!proposal) throw new Error("mandate change not found");
+
+  if (decision === "approved") {
+    const registry = loadRegistry();
+    const s = registry[proposal.strategyId];
+    if (s) {
+      Object.assign(s, proposal.after);
+      s.mandateVersion = (s.mandateVersion || 1) + 1;
+      saveRegistry(registry);
+    }
+  }
+  return appendEvent({ type: "mandate_change_decided", changeId, strategyId: proposal.strategyId, decision });
+}
+
+function getPendingMandateChanges() {
+  const events = readAllEvents();
+  const proposed = events.filter(e => e.type === "mandate_change_proposed");
+  const decided = events.filter(e => e.type === "mandate_change_decided").map(e => e.changeId);
+  return proposed.filter(p => !decided.includes(p.changeId));
+}
+
+// Returns approved-but-not-yet-responded-to mandate change notices for
+// strategies this investor holds — the "exit window" screen.
+function getMandateNoticesForInvestor(investorId) {
+  const events = readAllEvents();
+  const { positions } = rebuildState();
+  const heldStrategyIds = Object.keys(positions).filter(k => k.startsWith(investorId + "::") && positions[k].units > 0).map(k => k.split("::")[1]);
+
+  const decided = events.filter(e => e.type === "mandate_change_decided" && e.decision === "approved" && heldStrategyIds.includes(e.strategyId));
+  const responded = events.filter(e => e.type === "mandate_change_responded" && e.investorId === investorId).map(e => e.changeId);
+
+  return decided
+    .filter(d => !responded.includes(d.changeId))
+    .map(d => {
+      const proposal = events.find(e => e.type === "mandate_change_proposed" && e.changeId === d.changeId);
+      return proposal;
+    })
+    .filter(Boolean);
+}
+
+function respondToMandateChange(investorId, changeId, action) {
+  if (!["exit", "stay"].includes(action)) throw new Error("action must be exit or stay");
+  return appendEvent({ type: "mandate_change_responded", investorId, changeId, action });
+}
+
+// =====================================================================
+// STRATEGY CLOSURE — Stage 2, §G3. Orderly wind-down: announce with a
+// timeline, investors see estimated proceeds, ops finalizes to sweep
+// every remaining position back to its investor's wallet.
+// =====================================================================
+function initiateStrategyClosure(strategyId, targetDate) {
+  const registry = loadRegistry();
+  const s = registry[strategyId];
+  if (!s) throw new Error("strategy not found");
+  if (s.status !== "live") throw new Error("only live strategies can be closed");
+  s.status = "closing";
+  s.closureAnnouncedAt = new Date().toISOString();
+  s.closureTargetDate = targetDate || null;
+  saveRegistry(registry);
+  return appendEvent({ type: "strategy_closure_initiated", strategyId, targetDate: s.closureTargetDate });
+}
+
+function finalizeStrategyClosure(strategyId) {
+  const registry = loadRegistry();
+  const s = registry[strategyId];
+  if (!s) throw new Error("strategy not found");
+  if (s.status !== "closing") throw new Error("strategy is not in a closing state");
+
+  const { positions, posKey } = rebuildState();
+  const affected = Object.keys(positions).filter(k => k.endsWith("::" + strategyId) && positions[k].units > 0);
+  const swept = [];
+  for (const key of affected) {
+    const investorId = key.split("::")[0];
+    const pos = positions[key];
+    const { strategies, unitPrice } = rebuildState();
+    const value = pos.units * unitPrice(strategies[strategyId]);
+    if (value > 0) {
+      withdraw(investorId, strategyId, value);
+      swept.push({ investorId, amount: value });
+    }
+  }
+
+  s.status = "closed";
+  s.closedAt = new Date().toISOString();
+  saveRegistry(registry);
+  appendEvent({ type: "strategy_closure_finalized", strategyId, investorsSwept: swept.length });
+  return { investorsSwept: swept };
+}
+
+function getClosureNoticeForInvestor(investorId) {
+  const registry = loadRegistry();
+  const { positions, posKey, strategies, unitPrice } = rebuildState();
+  return Object.values(registry)
+    .filter(s => s.status === "closing")
+    .map(s => {
+      const pos = positions[posKey(investorId, s.id)];
+      if (!pos || pos.units <= 0) return null;
+      const liveStrategy = strategies[s.id]; // "closing" strategies ARE included in rebuildState's tracked set
+      const price = unitPrice(liveStrategy);
+      return { strategyId: s.id, strategyName: s.name, closureAnnouncedAt: s.closureAnnouncedAt, closureTargetDate: s.closureTargetDate, estimatedProceeds: pos.units * price };
+    })
+    .filter(Boolean);
+}
+
 module.exports = {
+
   rebuildState, deposit, withdraw, marketReturn, crystallizeFees,
   getPortfolio, getStrategies, getTraderCompensation, tierFor, TIERS,
   submitStrategy, decideStrategy, getRegistry,
@@ -478,4 +678,8 @@ module.exports = {
   CURRENT_DISCLOSURE_VERSION, acceptDisclosure, getDisclosureStatus,
   submitComplaint, updateComplaintStatus, getComplaints,
   getStatement, closeAccount, previewWithdrawal,
+  submitRiskEvent, acknowledgeRiskEvent, getRiskNoticesForInvestor,
+  proposeMandateChange, decideMandateChange, getPendingMandateChanges,
+  getMandateNoticesForInvestor, respondToMandateChange,
+  initiateStrategyClosure, finalizeStrategyClosure, getClosureNoticeForInvestor,
 };
