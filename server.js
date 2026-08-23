@@ -168,14 +168,26 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, record);
     }
 
-    // POST /withdraw  { strategyId, units } — investorId comes from the token
+    // GET /withdraw/preview?strategyId=X&amount=Y — live fee math before confirming
+    if (p === "/withdraw/preview" && req.method === "GET") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "investor") return send(res, 403, { error: "only investors can preview a withdrawal" });
+      const { strategyId, amount } = parsed.query;
+      const numAmount = Number(amount);
+      if (!strategyId || !Number.isFinite(numAmount)) return send(res, 400, { error: "strategyId and a numeric amount required" });
+      const preview = engine.previewWithdrawal(user.id, strategyId, numAmount);
+      return send(res, 200, preview);
+    }
+
+    // POST /withdraw  { strategyId, amount } — investorId comes from the token.
+    // amount is a DOLLAR AMOUNT (not units) — see engine.js for why (Stage 3 §3.5).
     if (p === "/withdraw" && req.method === "POST") {
       const user = auth.requireAuth(req);
       if (user.role !== "investor") return send(res, 403, { error: "only investors can withdraw" });
-      const { strategyId, units } = await readBody(req);
+      const { strategyId, amount } = await readBody(req);
       if (typeof strategyId !== "string" || !strategyId) return send(res, 400, { error: "strategyId required" });
-      if (typeof units !== "number" || !Number.isFinite(units)) return send(res, 400, { error: "units must be a number" });
-      const record = engine.withdraw(user.id, strategyId, units);
+      if (typeof amount !== "number" || !Number.isFinite(amount)) return send(res, 400, { error: "amount must be a number" });
+      const record = engine.withdraw(user.id, strategyId, amount);
       return send(res, 200, record);
     }
 
@@ -204,6 +216,76 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, engine.getTraderCompensation(traderId));
     }
 
+    // ===== SUITABILITY =====
+    if (p === "/suitability/questions" && req.method === "GET") {
+      return send(res, 200, engine.SUITABILITY_QUESTIONS);
+    }
+    if (p === "/suitability" && req.method === "POST") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "investor") return send(res, 403, { error: "investors only" });
+      const { answers } = await readBody(req);
+      const record = engine.submitSuitability(user.id, answers);
+      return send(res, 200, record);
+    }
+    if (p === "/suitability" && req.method === "GET") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "investor") return send(res, 403, { error: "investors only" });
+      return send(res, 200, engine.getSuitability(user.id));
+    }
+
+    // ===== DISCLOSURES =====
+    if (p === "/disclosures/status" && req.method === "GET") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "investor") return send(res, 403, { error: "investors only" });
+      return send(res, 200, engine.getDisclosureStatus(user.id));
+    }
+    if (p === "/disclosures/accept" && req.method === "POST") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "investor") return send(res, 403, { error: "investors only" });
+      const { version } = await readBody(req);
+      const record = engine.acceptDisclosure(user.id, version);
+      return send(res, 200, record);
+    }
+
+    // ===== COMPLAINTS =====
+    if (p === "/complaints" && req.method === "POST") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "investor") return send(res, 403, { error: "investors only" });
+      const { subject, message } = await readBody(req);
+      const record = engine.submitComplaint(user.id, subject, message);
+      return send(res, 200, record);
+    }
+    if (p === "/complaints" && req.method === "GET") {
+      const user = auth.requireAuth(req);
+      // Investors see only their own; ops sees everyone's — same pattern as strategies.
+      const investorFilter = user.role === "ops" ? null : user.id;
+      if (user.role !== "ops" && user.role !== "investor") return send(res, 403, { error: "not permitted" });
+      return send(res, 200, engine.getComplaints(investorFilter));
+    }
+    if (/^\/complaints\/[^/]+\/status$/.test(p) && req.method === "POST") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "ops") return send(res, 403, { error: "ops only" });
+      const complaintId = p.split("/")[2];
+      const { status, note } = await readBody(req);
+      const record = engine.updateComplaintStatus(complaintId, status, note);
+      return send(res, 200, record);
+    }
+
+    // ===== STATEMENT =====
+    if (p === "/statement" && req.method === "GET") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "investor") return send(res, 403, { error: "investors only" });
+      return send(res, 200, engine.getStatement(user.id));
+    }
+
+    // ===== ACCOUNT CLOSURE =====
+    if (p === "/account/close" && req.method === "POST") {
+      const user = auth.requireAuth(req);
+      if (user.role !== "investor") return send(res, 403, { error: "investors only" });
+      const record = engine.closeAccount(user.id);
+      return send(res, 200, record);
+    }
+
     // GET /ops/audit-log — ops role required
     if (p === "/ops/audit-log" && req.method === "GET") {
       const user = auth.requireAuth(req);
@@ -229,7 +311,7 @@ const server = http.createServer(async (req, res) => {
   } catch (err) {
     const authErrors = ["no token provided", "malformed token", "invalid token signature", "token expired", "user no longer exists"];
     const isAuthError = authErrors.includes(err.message);
-    const isBadRequest = /already exists|required|invalid email|must be a positive number|insufficient|at least 8 characters|incorrect|not found|you only hold|not found or not live|decision must be/i.test(err.message);
+    const isBadRequest = /already exists|required|invalid email|must be a positive number|insufficient|at least 8 characters|incorrect|not found|you only hold|not found or not live|decision must be|missing or invalid answer|version mismatch|invalid status|subject and message/i.test(err.message);
     const status = isAuthError ? 401 : (isBadRequest ? 400 : 500);
     return send(res, status, { error: err.message });
   }
