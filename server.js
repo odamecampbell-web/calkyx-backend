@@ -121,7 +121,7 @@ const server = http.createServer(async (req, res) => {
         let filtered = registry;
         if (traderId) filtered = filtered.filter(s => s.traderId === traderId);
         if (status) filtered = filtered.filter(s => s.status === status);
-        return send(res, 200, filtered);
+        return send(res, 200, engine.enrichWithFinancials(filtered));
       }
       return send(res, 200, engine.getStrategies());
     }

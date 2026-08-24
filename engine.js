@@ -318,6 +318,22 @@ function getStrategies() {
   return Object.values(strategies).filter(s => s.status === "live").map(s => ({ ...s, unitPrice: unitPrice(s), tier: tierFor(s.nav) }));
 }
 
+// Enriches raw registry entries (which only hold static metadata — name,
+// mandate, status, etc.) with the REAL computed financial fields (nav,
+// unitPrice, tier) that only rebuildState() knows how to calculate. Used
+// anywhere a filtered/status/traderId query needs numbers that are actually
+// correct, not just the registry's static fields. Pending/rejected
+// strategies (which never had real trading activity) correctly default to
+// nav 0 / unit price 100.
+function enrichWithFinancials(registryEntries) {
+  const { strategies, unitPrice } = rebuildState();
+  return registryEntries.map(entry => {
+    const live = strategies[entry.id];
+    if (live) return { ...entry, nav: live.nav, units: live.units, unitPrice: unitPrice(live), tier: tierFor(live.nav) };
+    return { ...entry, nav: 0, units: 0, unitPrice: 100, tier: tierFor(0) };
+  });
+}
+
 function getTraderCompensation(traderId) {
   const events = readAllEvents().filter(e => (e.type === "fee_crystallization" || (e.type === "withdrawal" && e.traderShare !== undefined)));
   const { strategies } = rebuildState();
@@ -682,4 +698,5 @@ module.exports = {
   proposeMandateChange, decideMandateChange, getPendingMandateChanges,
   getMandateNoticesForInvestor, respondToMandateChange,
   initiateStrategyClosure, finalizeStrategyClosure, getClosureNoticeForInvestor,
+  enrichWithFinancials,
 };
